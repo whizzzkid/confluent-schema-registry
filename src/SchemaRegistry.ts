@@ -1,20 +1,31 @@
 import { Response } from 'mappersmith'
 
-import { encode, MAGIC_BYTE } from './encoder'
-import decode from './decoder'
+import { encode, MAGIC_BYTE } from './wireEncoder'
+import decode from './wireDecoder'
 import { COMPATIBILITY, DEFAULT_SEPERATOR } from './constants'
-import API, {
-  SchemaRegistryAPIClientArgs,
-  SchemaRegistryAPIClientOptions,
-  SchemaRegistryAPIClient,
-} from './api'
+import API, { SchemaRegistryAPIClientArgs, SchemaRegistryAPIClient } from './api'
 import Cache from './cache'
 import {
   ConfluentSchemaRegistryError,
   ConfluentSchemaRegistryArgumentError,
   ConfluentSchemaRegistryCompatibilityError,
+  ConfluentSchemaRegistryValidationError,
 } from './errors'
-import { Schema, RawSchema } from './@types'
+import {
+  Schema,
+  RawAvroSchema,
+  AvroSchema,
+  SchemaType,
+  ConfluentSchema,
+  ConfluentSubject,
+  SchemaRegistryAPIClientOptions,
+  AvroConfluentSchema,
+} from './@types'
+import {
+  helperTypeFromSchemaType,
+  schemaTypeFromString,
+  schemaFromConfluentSchema,
+} from './schemaTypeResolver'
 
 interface RegisteredSchema {
   id: number
@@ -23,7 +34,7 @@ interface RegisteredSchema {
 interface Opts {
   compatibility?: COMPATIBILITY
   separator?: string
-  subject?: string
+  subject: string
 }
 
 const DEFAULT_OPTS = {
@@ -34,6 +45,7 @@ const DEFAULT_OPTS = {
 export default class SchemaRegistry {
   private api: SchemaRegistryAPIClient
   private cacheMissRequests: { [key: number]: Promise<Response> } = {}
+  private options: SchemaRegistryAPIClientOptions | undefined
 
   public cache: Cache
 
@@ -42,29 +54,68 @@ export default class SchemaRegistry {
     options?: SchemaRegistryAPIClientOptions,
   ) {
     this.api = API({ auth, clientId, host, retry })
-    this.cache = new Cache(options?.forSchemaOptions)
+    this.cache = new Cache()
+    this.options = options
   }
 
-  public async register(schema: RawSchema, userOpts?: Opts): Promise<RegisteredSchema> {
+  private isConfluentSchema(
+    schema: RawAvroSchema | AvroSchema | ConfluentSchema,
+  ): schema is ConfluentSchema {
+    return (schema as ConfluentSchema).schema != null
+  }
+
+  private getConfluentSchema(
+    schema: RawAvroSchema | AvroSchema | ConfluentSchema,
+  ): ConfluentSchema {
+    let confluentSchema: ConfluentSchema
+    // convert data from old api (for backwards compatibility)
+    if (!this.isConfluentSchema(schema)) {
+      // schema is instanceof RawAvroSchema or AvroSchema
+      confluentSchema = {
+        type: SchemaType.AVRO,
+        schema: JSON.stringify(schema),
+      }
+    } else {
+      confluentSchema = schema as ConfluentSchema
+    }
+    return confluentSchema
+  }
+
+  public async register(
+    schema: Exclude<ConfluentSchema, AvroConfluentSchema>,
+    userOpts: Opts,
+  ): Promise<RegisteredSchema>
+  public async register(
+    schema: RawAvroSchema | AvroConfluentSchema,
+    userOpts?: Omit<Opts, 'subject'> & { subject?: string },
+  ): Promise<RegisteredSchema>
+  public async register(
+    schema: RawAvroSchema | ConfluentSchema,
+    userOpts: Opts,
+  ): Promise<RegisteredSchema>
+  public async register(
+    schema: RawAvroSchema | ConfluentSchema,
+    userOpts?: Opts,
+  ): Promise<RegisteredSchema> {
     const { compatibility, separator } = { ...DEFAULT_OPTS, ...userOpts }
 
-    if (!schema.name) {
-      throw new ConfluentSchemaRegistryArgumentError(`Invalid name: ${schema.name}`)
-    }
+    const confluentSchema: ConfluentSchema = this.getConfluentSchema(schema)
 
-    let subject: string
-    if (userOpts && userOpts.subject) {
-      subject = userOpts.subject
-    } else {
-      if (!schema.namespace) {
-        throw new ConfluentSchemaRegistryArgumentError(`Invalid namespace: ${schema.namespace}`)
+    const helper = helperTypeFromSchemaType(confluentSchema.type)
+    const schemaInstance = schemaFromConfluentSchema(confluentSchema, this.options)
+    helper.validate(schemaInstance)
+
+    let subject: ConfluentSubject
+    if (userOpts?.subject) {
+      subject = {
+        name: userOpts.subject,
       }
-
-      subject = [schema.namespace, schema.name].join(separator)
+    } else {
+      subject = helper.getSubject(confluentSchema, schemaInstance, separator)
     }
 
     try {
-      const response = await this.api.Subject.config({ subject })
+      const response = await this.api.Subject.config({ subject: subject.name })
       const { compatibilityLevel }: { compatibilityLevel: COMPATIBILITY } = response.data()
 
       if (compatibilityLevel.toUpperCase() !== compatibility) {
@@ -78,23 +129,26 @@ export default class SchemaRegistry {
       }
 
       if (compatibility) {
-        await this.api.Subject.updateConfig({ subject, body: { compatibility } })
+        await this.api.Subject.updateConfig({ subject: subject.name, body: { compatibility } })
       }
     }
 
     const response = await this.api.Subject.register({
-      subject,
-      body: { schema: JSON.stringify(schema) },
+      subject: subject.name,
+      body: {
+        schemaType: confluentSchema.type,
+        schema: confluentSchema.schema,
+      },
     })
 
     const registeredSchema: RegisteredSchema = response.data()
-    this.cache.setLatestRegistryId(subject, registeredSchema.id)
-    this.cache.setSchema(registeredSchema.id, schema)
+    this.cache.setLatestRegistryId(subject.name, registeredSchema.id)
+    this.cache.setSchema(registeredSchema.id, schemaInstance)
 
     return registeredSchema
   }
 
-  public async getSchema(registryId: number): Promise<Schema> {
+  public async getSchema(registryId: number): Promise<Schema | AvroSchema> {
     const schema = this.cache.getSchema(registryId)
 
     if (schema) {
@@ -102,13 +156,23 @@ export default class SchemaRegistry {
     }
 
     const response = await this.getSchemaOriginRequest(registryId)
-    const foundSchema: { schema: string } = response.data()
-    const rawSchema: RawSchema = JSON.parse(foundSchema.schema)
+    const foundSchema: { schema: string; schemaType: string } = response.data()
+    const rawSchema = foundSchema.schema
+    const schemaType = schemaTypeFromString(foundSchema.schemaType)
 
-    return this.cache.setSchema(registryId, rawSchema)
+    if (schemaType === SchemaType.UNKNOWN) {
+      throw new ConfluentSchemaRegistryError(`Unknown schema type ${foundSchema.schemaType}`)
+    }
+
+    const confluentSchema: ConfluentSchema = {
+      type: schemaType,
+      schema: rawSchema,
+    }
+    const schemaInstance = schemaFromConfluentSchema(confluentSchema, this.options)
+    return this.cache.setSchema(registryId, schemaInstance)
   }
 
-  public async encode(registryId: number, jsonPayload: any): Promise<Buffer> {
+  public async encode(registryId: number, payload: any): Promise<Buffer> {
     if (!registryId) {
       throw new ConfluentSchemaRegistryArgumentError(
         `Invalid registryId: ${JSON.stringify(registryId)}`,
@@ -116,8 +180,24 @@ export default class SchemaRegistry {
     }
 
     const schema = await this.getSchema(registryId)
+    try {
+      const serializedPayload = schema.toBuffer(payload)
+      return encode(registryId, serializedPayload)
+    } catch (error) {
+      if (error instanceof ConfluentSchemaRegistryValidationError) throw error
 
-    return encode(schema, registryId, jsonPayload)
+      const paths = this.collectInvalidPaths(schema, payload)
+      throw new ConfluentSchemaRegistryValidationError(error, paths)
+    }
+  }
+
+  private collectInvalidPaths(schema: Schema, jsonPayload: object) {
+    const paths: string[][] = []
+    schema.isValid(jsonPayload, {
+      errorHook: path => paths.push(path),
+    })
+
+    return paths
   }
 
   public async decode(buffer: Buffer): Promise<any> {
@@ -135,7 +215,6 @@ export default class SchemaRegistry {
     }
 
     const schema = await this.getSchema(registryId)
-
     return schema.fromBuffer(payload)
   }
 
@@ -146,11 +225,18 @@ export default class SchemaRegistry {
     return id
   }
 
-  public async getRegistryIdBySchema(subject: string, schema: Schema): Promise<number> {
+  public async getRegistryIdBySchema(
+    subject: string,
+    schema: AvroSchema | RawAvroSchema | ConfluentSchema,
+  ): Promise<number> {
     try {
+      const confluentSchema: ConfluentSchema = this.getConfluentSchema(schema)
       const response = await this.api.Subject.registered({
         subject,
-        body: { schema: JSON.stringify(schema) },
+        body: {
+          schemaType: confluentSchema.type,
+          schema: confluentSchema.schema,
+        },
       })
       const { id }: { id: number } = response.data()
 
